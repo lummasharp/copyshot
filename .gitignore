@@ -1,7 +1,9 @@
 # Rust build output
 /target/
+.agents/
 
 # Local editor and OS files
+.agents/
 .vscode/
 .idea/
 *.user
