@@ -30,3 +30,8 @@ windows-sys = { version = "0.59", features = [
 
 [build-dependencies]
 winresource = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "screenshot"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+url = "2"

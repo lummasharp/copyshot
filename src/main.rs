@@ -1,4 +1,7 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+#[cfg(windows)]
+mod windows {
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -101,7 +104,7 @@ struct Capture {
     bgra: Vec<u8>,
 }
 
-fn main() {
+pub fn main() {
     if let Err(err) = run() {
         unsafe {
             MessageBoxW(
@@ -1244,3 +1247,24 @@ mod tests {
         assert_eq!(bgra_to_rgba(&[1, 2, 3, 4]), vec![3, 2, 1, 255]);
     }
 }
+
+}
+
+#[cfg(windows)]
+fn main() {
+    windows::main();
+}
+
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(target_os = "linux")]
+fn main() {
+    if let Err(err) = linux::run() {
+        eprintln!("Copyshot: {err}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+compile_error!("Copyshot currently supports Windows and Linux.");
