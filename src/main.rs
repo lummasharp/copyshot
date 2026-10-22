@@ -1,7 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-#[cfg(windows)]
-mod windows {
+#[cfg(not(windows))]
+compile_error!("Copyshot only supports Windows.");
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -21,6 +21,7 @@ use windows_sys::Win32::System::Ole::CF_DIB;
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::SystemServices::MK_LBUTTON;
+use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -104,7 +105,7 @@ struct Capture {
     bgra: Vec<u8>,
 }
 
-pub fn main() {
+fn main() {
     if let Err(err) = run() {
         unsafe {
             MessageBoxW(
@@ -119,6 +120,11 @@ pub fn main() {
 
 fn run() -> Result<(), String> {
     unsafe {
+        // Without this, Windows reports scaled sizes at non-100% display scaling and captures get cropped.
+        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
+            SetProcessDPIAware();
+        }
+
         let hinstance = GetModuleHandleW(null());
         if hinstance.is_null() {
             return Err("Could not get module handle.".to_string());
@@ -165,7 +171,7 @@ fn run() -> Result<(), String> {
             );
         }
 
-        ensure_startup_enabled();
+        enable_startup_on_first_run();
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -1031,10 +1037,20 @@ unsafe fn toggle_startup() {
     }
 }
 
-unsafe fn ensure_startup_enabled() {
-    if !startup_enabled() {
-        let _ = set_startup(true);
+// Only enable startup once, so turning it off in the tray menu sticks across launches.
+unsafe fn enable_startup_on_first_run() {
+    let Some(dir) = std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join(APP_NAME))
+    else {
+        return;
+    };
+    let marker = dir.join("startup-configured");
+    if marker.exists() {
+        return;
     }
+    if !startup_enabled() && set_startup(true).is_err() {
+        return;
+    }
+    let _ = fs::create_dir_all(&dir).and_then(|_| fs::write(&marker, ""));
 }
 
 unsafe fn startup_enabled() -> bool {
@@ -1164,16 +1180,14 @@ fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
 }
 
 unsafe fn load_app_icon() -> HICON {
-    let icon_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("copyshot.ico");
+    // build.rs embeds src/copyshot.ico as icon resource ID 1.
     let icon = LoadImageW(
-        null_mut(),
-        wide_path(&icon_path).as_ptr(),
+        GetModuleHandleW(null()),
+        1 as _,
         IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON),
+        GetSystemMetrics(SM_CYSMICON),
         0,
-        0,
-        LR_LOADFROMFILE | LR_DEFAULTSIZE,
     ) as HICON;
     if icon.is_null() {
         LoadIconW(null_mut(), IDI_APPLICATION)
@@ -1246,25 +1260,59 @@ mod tests {
     fn converts_bgra_to_rgba() {
         assert_eq!(bgra_to_rgba(&[1, 2, 3, 4]), vec![3, 2, 1, 255]);
     }
-}
 
-}
+    #[test]
+    fn clamps_rect_to_bounds() {
+        let rect = Rect {
+            x: -5,
+            y: 8,
+            width: 20,
+            height: 20,
+        };
+        assert_eq!(
+            clamp_rect_to_size(10, 10, rect),
+            Some(Rect {
+                x: 0,
+                y: 8,
+                width: 10,
+                height: 2
+            })
+        );
+        assert_eq!(
+            clamp_rect_to_size(
+                10,
+                10,
+                Rect {
+                    x: 12,
+                    y: 0,
+                    width: 5,
+                    height: 5
+                }
+            ),
+            None
+        );
+    }
 
-#[cfg(windows)]
-fn main() {
-    windows::main();
-}
-
-#[cfg(target_os = "linux")]
-mod linux;
-
-#[cfg(target_os = "linux")]
-fn main() {
-    if let Err(err) = linux::run() {
-        eprintln!("Copyshot: {err}");
-        std::process::exit(1);
+    #[test]
+    fn crops_odd_sized_capture() {
+        // 3x2 capture where each pixel's blue channel is its index.
+        let capture = Capture {
+            width: 3,
+            height: 2,
+            bgra: (0..6u8).flat_map(|i| [i, 0, 0, 255]).collect(),
+        };
+        let cropped = crop_capture(
+            &capture,
+            Rect {
+                x: 1,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!((cropped.width, cropped.height), (2, 2));
+        let blues: Vec<u8> = cropped.bgra.chunks(4).map(|p| p[0]).collect();
+        assert_eq!(blues, vec![1, 2, 4, 5]);
     }
 }
-
-#[cfg(not(any(windows, target_os = "linux")))]
-compile_error!("Copyshot currently supports Windows and Linux.");
