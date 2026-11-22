@@ -3,17 +3,22 @@
 #[cfg(not(windows))]
 compile_error!("Copyshot only supports Windows.");
 
+mod update;
+
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::fs::{self, File};
-use std::io::BufWriter;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, ErrorKind};
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows_sys::Win32::Graphics::Gdi::*;
+use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
 use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::*;
@@ -21,6 +26,7 @@ use windows_sys::Win32::System::Ole::CF_DIB;
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::SystemServices::MK_LBUTTON;
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::*;
@@ -30,22 +36,39 @@ const APP_NAME: &str = "Copyshot";
 const WM_TRAYICON: u32 = WM_APP + 1;
 const WM_CAPTURE_REGION: u32 = WM_APP + 2;
 const WM_CAPTURE_FULLSCREEN: u32 = WM_APP + 3;
+const WM_CAPTURE_WINDOW: u32 = WM_APP + 4;
+const WM_UPDATE_FOUND: u32 = WM_APP + 5;
+const WM_UPDATE_INSTALL_DONE: u32 = WM_APP + 6;
+const WM_ALREADY_RUNNING: u32 = WM_APP + 7;
 const TRAY_UID: u32 = 1;
 const MENU_REGION: usize = 1001;
 const MENU_FULLSCREEN: usize = 1002;
 const MENU_OPEN_FOLDER: usize = 1003;
 const MENU_STARTUP: usize = 1004;
 const MENU_EXIT: usize = 1005;
+const MENU_SOUND: usize = 1006;
+const MENU_UPDATE: usize = 1007;
 const STARTUP_VALUE: &str = "Copyshot";
+const MAIN_CLASS: &str = "CopyshotMainWindow";
 const OVERLAY_FADE_TIMER: usize = 1;
 const OVERLAY_FADE_INTERVAL_MS: u32 = 12;
 const OVERLAY_DIM_ALPHA: u8 = 132;
 const OVERLAY_FADE_STEP: u8 = 18;
+const UPDATE_TIMER: usize = 2;
+// Copyshot usually runs for days, so check again twice a day, not only at login.
+const UPDATE_INTERVAL_MS: u32 = 12 * 60 * 60 * 1000;
+const SOUND_OFF_MARKER: &str = "sound-off";
+// An unassigned virtual key; tapping it stops a lone Alt release from opening menu bars.
+const VK_MENU_MASK: u16 = 0xE8;
 
 thread_local! {
     static APP: RefCell<Option<AppState>> = const { RefCell::new(None) };
     static OVERLAY: RefCell<Option<OverlayState>> = const { RefCell::new(None) };
 }
+
+// Background update threads hand results to the UI thread through these.
+static FOUND_UPDATE: Mutex<Option<update::Update>> = Mutex::new(None);
+static UPDATE_INSTALL_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Rect {
@@ -79,10 +102,16 @@ impl Rect {
 struct AppState {
     hwnd: HWND,
     screenshot_dir: PathBuf,
+    sound_enabled: bool,
+    available_update: Option<update::Update>,
+    update_balloon_shown: bool,
+    installing_update: bool,
 }
 
 struct OverlayState {
     hwnd: HWND,
+    font: HFONT,
+    scale: f32,
     frozen: Capture,
     base: Vec<u8>,
     frame: Vec<u8>,
@@ -125,6 +154,17 @@ fn run() -> Result<(), String> {
             SetProcessDPIAware();
         }
 
+        // One Copyshot per session; a second launch just tells the first one to say hello.
+        // The handle stays open for the life of the process.
+        let _instance = CreateMutexW(null(), 0, wide("Local\\Copyshot.SingleInstance").as_ptr());
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let existing = FindWindowW(wide(MAIN_CLASS).as_ptr(), null());
+            if !existing.is_null() {
+                PostMessageW(existing, WM_ALREADY_RUNNING, 0, 0);
+            }
+            return Ok(());
+        }
+
         let hinstance = GetModuleHandleW(null());
         if hinstance.is_null() {
             return Err("Could not get module handle.".to_string());
@@ -134,7 +174,7 @@ fn run() -> Result<(), String> {
 
         let hwnd = CreateWindowExW(
             0,
-            wide("CopyshotMainWindow").as_ptr(),
+            wide(MAIN_CLASS).as_ptr(),
             wide(APP_NAME).as_ptr(),
             0,
             0,
@@ -158,6 +198,10 @@ fn run() -> Result<(), String> {
             *app.borrow_mut() = Some(AppState {
                 hwnd,
                 screenshot_dir,
+                sound_enabled: !settings_dir().join(SOUND_OFF_MARKER).exists(),
+                available_update: None,
+                update_balloon_shown: false,
+                installing_update: false,
             });
         });
 
@@ -172,6 +216,13 @@ fn run() -> Result<(), String> {
         }
 
         enable_startup_on_first_run();
+        // Point the startup entry at this exe, e.g. after moving from a dev build to the installer.
+        if startup_enabled() {
+            let _ = set_startup(true);
+        }
+
+        start_update_check(hwnd);
+        SetTimer(hwnd, UPDATE_TIMER, UPDATE_INTERVAL_MS, None);
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -188,7 +239,7 @@ fn run() -> Result<(), String> {
 }
 
 unsafe fn register_window_classes(hinstance: HINSTANCE) -> Result<(), String> {
-    let main_class_name = wide("CopyshotMainWindow");
+    let main_class_name = wide(MAIN_CLASS);
     let main_class = WNDCLASSW {
         lpfnWndProc: Some(main_wnd_proc),
         hInstance: hinstance,
@@ -227,6 +278,8 @@ unsafe extern "system" fn main_wnd_proc(
                 MENU_FULLSCREEN => capture_fullscreen(),
                 MENU_OPEN_FOLDER => open_screenshot_folder(),
                 MENU_STARTUP => toggle_startup(),
+                MENU_SOUND => toggle_sound(),
+                MENU_UPDATE => install_update(),
                 MENU_EXIT => {
                     DestroyWindow(hwnd);
                 }
@@ -242,12 +295,53 @@ unsafe extern "system" fn main_wnd_proc(
             capture_fullscreen();
             0
         }
+        WM_CAPTURE_WINDOW => {
+            capture_active_window();
+            0
+        }
+        WM_ALREADY_RUNNING => {
+            notify(
+                "Copyshot is already running",
+                "It lives in the tray. Press Print Screen to capture.",
+            );
+            0
+        }
+        WM_UPDATE_FOUND => {
+            on_update_found();
+            0
+        }
+        WM_UPDATE_INSTALL_DONE => {
+            if wparam == 1 {
+                // The installer is running and will start the new version.
+                DestroyWindow(hwnd);
+            } else {
+                with_app(|app| app.installing_update = false);
+                let error = UPDATE_INSTALL_ERROR
+                    .lock()
+                    .ok()
+                    .and_then(|mut error| error.take())
+                    .unwrap_or_default();
+                notify("Update failed", &error);
+            }
+            0
+        }
+        WM_TIMER => {
+            if wparam == UPDATE_TIMER {
+                start_update_check(hwnd);
+            }
+            0
+        }
         WM_TRAYICON => {
+            // NOTIFYICON_VERSION: right-click and Shift+F10 both arrive as WM_CONTEXTMENU.
             let event = loword(lparam as usize) as u32;
-            if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
+            if event == WM_CONTEXTMENU {
                 show_tray_menu(hwnd);
             } else if event == WM_LBUTTONDBLCLK {
                 start_region_capture();
+            } else if event == NIN_BALLOONUSERCLICK
+                && with_app(|app| app.update_balloon_shown).unwrap_or(false)
+            {
+                install_update();
             }
             0
         }
@@ -266,7 +360,11 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         if event == WM_KEYDOWN || event == WM_SYSKEYDOWN {
             let key = &*(lparam as *const KBDLLHOOKSTRUCT);
             if key.vkCode == VK_SNAPSHOT as u32 {
-                let message = if shift_pressed() {
+                let alt = key.flags & LLKHF_ALTDOWN != 0;
+                let message = if alt {
+                    mask_alt_release();
+                    WM_CAPTURE_WINDOW
+                } else if shift_pressed() {
                     WM_CAPTURE_FULLSCREEN
                 } else {
                     WM_CAPTURE_REGION
@@ -321,6 +419,10 @@ unsafe extern "system" fn overlay_wnd_proc(
                         let new = current_selection(overlay);
                         let dirty = update_overlay_selection(overlay, old, new);
                         invalidate_rect(hwnd, dirty);
+                        // The size label is drawn on top at paint time, outside the selection.
+                        for selection in [old, new].into_iter().flatten() {
+                            invalidate_rect(hwnd, Some(overlay_label_rect(overlay, selection)));
+                        }
                     }
                 });
             }
@@ -341,6 +443,11 @@ unsafe extern "system" fn overlay_wnd_proc(
                     notify("Screenshot failed", &err);
                 }
             }
+            start_overlay_fade_out(hwnd);
+            0
+        }
+        WM_RBUTTONUP => {
+            ReleaseCapture();
             start_overlay_fade_out(hwnd);
             0
         }
@@ -395,10 +502,15 @@ unsafe extern "system" fn overlay_wnd_proc(
         WM_ERASEBKGND => 1,
         WM_DESTROY => {
             KillTimer(hwnd, OVERLAY_FADE_TIMER);
-            let should_clear = OVERLAY.with(|overlay| {
-                overlay.borrow().as_ref().map(|overlay| overlay.hwnd) == Some(hwnd)
+            let font = OVERLAY.with(|overlay| {
+                overlay
+                    .borrow()
+                    .as_ref()
+                    .filter(|overlay| overlay.hwnd == hwnd)
+                    .map(|overlay| overlay.font)
             });
-            if should_clear {
+            if let Some(font) = font {
+                DeleteObject(font as _);
                 OVERLAY.with(|overlay| *overlay.borrow_mut() = None);
             }
             0
@@ -454,9 +566,29 @@ unsafe fn start_region_capture() {
         return;
     }
 
+    let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+    let font = CreateFontW(
+        -(13.0 * scale).round() as i32,
+        0,
+        0,
+        0,
+        FW_SEMIBOLD as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET as u32,
+        0,
+        0,
+        CLEARTYPE_QUALITY as u32,
+        0,
+        wide("Segoe UI").as_ptr(),
+    );
+
     OVERLAY.with(|overlay| {
         *overlay.borrow_mut() = Some(OverlayState {
             hwnd,
+            font,
+            scale,
             frozen,
             base,
             frame,
@@ -488,20 +620,151 @@ unsafe fn paint_overlay(hwnd: HWND) {
                 overlay.frozen.height,
                 &overlay.frame,
             );
+            if overlay.fade != FadeDirection::Out {
+                if let Some(selection) = current_selection(overlay) {
+                    paint_size_label(hdc, overlay, selection);
+                }
+            }
         }
     });
 
     EndPaint(hwnd, &ps);
 }
 
+unsafe fn paint_size_label(hdc: HDC, overlay: &OverlayState, selection: Rect) {
+    let label = overlay_label_rect(overlay, selection);
+    let mut rect = RECT {
+        left: label.x,
+        top: label.y,
+        right: label.x + label.width,
+        bottom: label.y + label.height,
+    };
+    let brush = CreateSolidBrush(rgb(24, 24, 27));
+    FillRect(hdc, &rect, brush);
+    DeleteObject(brush as _);
+
+    let old_font = SelectObject(hdc, overlay.font as _);
+    SetBkMode(hdc, TRANSPARENT as i32);
+    SetTextColor(hdc, rgb(255, 255, 255));
+    let text = wide(&format!(
+        "{} \u{00d7} {}",
+        selection.width, selection.height
+    ));
+    DrawTextW(
+        hdc,
+        text.as_ptr(),
+        -1,
+        &mut rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+    SelectObject(hdc, old_font);
+}
+
+fn overlay_label_rect(overlay: &OverlayState, selection: Rect) -> Rect {
+    label_rect(
+        selection,
+        overlay.scale,
+        overlay.frozen.width as i32,
+        overlay.frozen.height as i32,
+    )
+}
+
+/// Where the "W × H" label goes: above the selection, else below it, else inside it,
+/// always kept on screen.
+fn label_rect(selection: Rect, scale: f32, screen_width: i32, screen_height: i32) -> Rect {
+    let width = (112.0 * scale).round() as i32;
+    let height = (24.0 * scale).round() as i32;
+    let gap = (6.0 * scale).round() as i32;
+    let above = selection.y - height - gap;
+    let below = selection.y + selection.height + gap;
+    let y = if above >= 0 {
+        above
+    } else if below + height <= screen_height {
+        below
+    } else {
+        selection.y + gap
+    };
+    Rect {
+        x: selection.x.min(screen_width - width).max(0),
+        y,
+        width,
+        height,
+    }
+}
+
 unsafe fn capture_fullscreen() {
-    let rect = Rect {
+    capture_rect(virtual_screen());
+}
+
+unsafe fn virtual_screen() -> Rect {
+    Rect {
         x: GetSystemMetrics(SM_XVIRTUALSCREEN),
         y: GetSystemMetrics(SM_YVIRTUALSCREEN),
         width: GetSystemMetrics(SM_CXVIRTUALSCREEN),
         height: GetSystemMetrics(SM_CYVIRTUALSCREEN),
+    }
+}
+
+unsafe fn capture_active_window() {
+    let window = GetForegroundWindow();
+    if window.is_null() {
+        notify(
+            "Window capture failed",
+            "There is no active window to capture.",
+        );
+        return;
+    }
+    // The DWM frame bounds skip the invisible resize borders that GetWindowRect includes.
+    let mut bounds: RECT = zeroed();
+    if DwmGetWindowAttribute(
+        window,
+        DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+        &mut bounds as *mut RECT as *mut c_void,
+        size_of::<RECT>() as u32,
+    ) < 0
+        && GetWindowRect(window, &mut bounds) == 0
+    {
+        notify(
+            "Window capture failed",
+            "Could not find the window's position.",
+        );
+        return;
+    }
+    let window_rect = Rect {
+        x: bounds.left,
+        y: bounds.top,
+        width: bounds.right - bounds.left,
+        height: bounds.bottom - bounds.top,
     };
-    capture_rect(rect);
+    match intersect_rect(window_rect, virtual_screen()) {
+        Some(rect) => capture_rect(rect),
+        None => notify("Window capture failed", "The active window is off screen."),
+    }
+}
+
+fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    (right > left && bottom > top).then_some(Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+unsafe fn mask_alt_release() {
+    let mut inputs: [INPUT; 2] = zeroed();
+    for (index, input) in inputs.iter_mut().enumerate() {
+        input.r#type = INPUT_KEYBOARD;
+        input.Anonymous.ki.wVk = VK_MENU_MASK;
+        if index == 1 {
+            input.Anonymous.ki.dwFlags = KEYEVENTF_KEYUP;
+        }
+    }
+    SendInput(2, inputs.as_ptr(), size_of::<INPUT>() as i32);
 }
 
 unsafe fn capture_rect(rect: Rect) {
@@ -516,7 +779,60 @@ fn finish_capture(capture: Capture) -> Result<PathBuf, String> {
     unsafe {
         copy_capture_to_clipboard(&capture)?;
     }
+    if with_app(|app| app.sound_enabled).unwrap_or(false) {
+        play_chime();
+    }
     Ok(path)
+}
+
+fn play_chime() {
+    static CHIME: OnceLock<Vec<u8>> = OnceLock::new();
+    let wav = CHIME.get_or_init(chime_wav);
+    // SND_ASYNC keeps reading the buffer after returning, so it must be 'static.
+    unsafe {
+        PlaySoundW(
+            wav.as_ptr() as *const u16,
+            null_mut(),
+            SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+        );
+    }
+}
+
+/// A quiet two-note chime (E6 then A6), generated so no audio file has to ship.
+fn chime_wav() -> Vec<u8> {
+    const RATE: u32 = 44_100;
+    const SECONDS: f32 = 0.3;
+    const VOLUME: f32 = 0.12;
+    let len = (RATE as f32 * SECONDS) as usize;
+    let mut samples = vec![0f32; len];
+    for (frequency, start) in [(1318.5f32, 0.0f32), (1760.0, 0.07)] {
+        let offset = (start * RATE as f32) as usize;
+        for (index, sample) in samples.iter_mut().enumerate().skip(offset) {
+            let t = (index - offset) as f32 / RATE as f32;
+            let envelope = (t * 400.0).min(1.0) * (-t * 20.0).exp();
+            *sample += (std::f32::consts::TAU * frequency * t).sin() * envelope * VOLUME;
+        }
+    }
+
+    let data_len = (len * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + len * 2);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for sample in samples {
+        let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        wav.extend_from_slice(&value.to_le_bytes());
+    }
+    wav
 }
 
 unsafe fn start_overlay_fade_out(hwnd: HWND) {
@@ -847,8 +1163,7 @@ fn save_capture(capture: &Capture) -> Result<PathBuf, String> {
             .unwrap_or_else(screenshot_dir)
     });
     fs::create_dir_all(&dir).map_err(|err| format!("Could not create screenshot folder: {err}"))?;
-    let path = dir.join(format!("Screenshot {}.png", timestamp()));
-    let file = File::create(&path).map_err(|err| format!("Could not create PNG file: {err}"))?;
+    let (file, path) = create_unique_file(&dir, &format!("Screenshot {}", timestamp()))?;
     let writer = BufWriter::new(file);
     let mut encoder = png::Encoder::new(writer, capture.width, capture.height);
     encoder.set_color(png::ColorType::Rgba);
@@ -860,6 +1175,25 @@ fn save_capture(capture: &Capture) -> Result<PathBuf, String> {
         .write_image_data(&bgra_to_rgba(&capture.bgra))
         .map_err(|err| format!("Could not write PNG file: {err}"))?;
     Ok(path)
+}
+
+/// Creates `<stem>.png`, or `<stem> (2).png` and so on, so captures taken within the same
+/// second never overwrite each other.
+fn create_unique_file(dir: &Path, stem: &str) -> Result<(File, PathBuf), String> {
+    for attempt in 1.. {
+        let name = if attempt == 1 {
+            format!("{stem}.png")
+        } else {
+            format!("{stem} ({attempt}).png")
+        };
+        let path = dir.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("Could not create PNG file: {err}")),
+        }
+    }
+    unreachable!()
 }
 
 unsafe fn copy_capture_to_clipboard(capture: &Capture) -> Result<(), String> {
@@ -931,6 +1265,9 @@ unsafe fn add_tray_icon(hwnd: HWND) {
     nid.hIcon = load_app_icon();
     copy_wide_to_fixed(&mut nid.szTip, APP_NAME);
     Shell_NotifyIconW(NIM_ADD, &nid);
+    // Needed for balloon-click notifications (the update prompt).
+    nid.Anonymous.uVersion = NOTIFYICON_VERSION;
+    Shell_NotifyIconW(NIM_SETVERSION, &nid);
 }
 
 unsafe fn remove_tray_icon(hwnd: HWND) {
@@ -942,15 +1279,14 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 }
 
 unsafe fn notify(title: &str, message: &str) {
-    let hwnd = APP.with(|app| {
-        app.borrow()
-            .as_ref()
-            .map(|app| app.hwnd)
-            .unwrap_or(null_mut())
-    });
-    if hwnd.is_null() {
+    show_balloon(title, message);
+    with_app(|app| app.update_balloon_shown = false);
+}
+
+unsafe fn show_balloon(title: &str, message: &str) {
+    let Some(hwnd) = with_app(|app| app.hwnd) else {
         return;
-    }
+    };
     let mut nid: NOTIFYICONDATAW = zeroed();
     nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
     nid.hWnd = hwnd;
@@ -967,6 +1303,24 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     if menu.is_null() {
         return;
     }
+    let (update, installing) = with_app(|app| {
+        (
+            app.available_update
+                .as_ref()
+                .map(|update| update.version.clone()),
+            app.installing_update,
+        )
+    })
+    .unwrap_or((None, false));
+    if let Some(version) = update {
+        let (flags, label) = if installing {
+            (MF_STRING | MF_GRAYED, "Installing update...".to_string())
+        } else {
+            (MF_STRING, format!("Install update {version}"))
+        };
+        AppendMenuW(menu, flags, MENU_UPDATE, wide(&label).as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    }
     AppendMenuW(
         menu,
         MF_STRING,
@@ -979,6 +1333,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         MENU_FULLSCREEN,
         wide("Capture fullscreen\tShift+PrtSc").as_ptr(),
     );
+    // No menu entry for window capture: opening the menu makes the taskbar the active window.
     AppendMenuW(
         menu,
         MF_STRING,
@@ -997,6 +1352,18 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         startup_flags,
         MENU_STARTUP,
         wide("Start with Windows").as_ptr(),
+    );
+    let sound_flags = MF_STRING
+        | if with_app(|app| app.sound_enabled).unwrap_or(false) {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+    AppendMenuW(
+        menu,
+        sound_flags,
+        MENU_SOUND,
+        wide("Play capture sound").as_ptr(),
     );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, MENU_EXIT, wide("Exit").as_ptr());
@@ -1037,12 +1404,107 @@ unsafe fn toggle_startup() {
     }
 }
 
-// Only enable startup once, so turning it off in the tray menu sticks across launches.
-unsafe fn enable_startup_on_first_run() {
-    let Some(dir) = std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join(APP_NAME))
-    else {
+fn toggle_sound() {
+    let Some(enabled) = with_app(|app| {
+        app.sound_enabled = !app.sound_enabled;
+        app.sound_enabled
+    }) else {
         return;
     };
+    let dir = settings_dir();
+    let marker = dir.join(SOUND_OFF_MARKER);
+    let _ = if enabled {
+        fs::remove_file(marker)
+    } else {
+        fs::create_dir_all(&dir).and_then(|_| fs::write(marker, ""))
+    };
+    if enabled {
+        play_chime();
+    }
+}
+
+fn start_update_check(hwnd: HWND) {
+    // shortcut: dev builds never self-update; test the flow with a release build.
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let hwnd = hwnd as usize;
+    std::thread::spawn(move || {
+        if let Ok(Some(update)) = update::check() {
+            if let Ok(mut found) = FOUND_UPDATE.lock() {
+                *found = Some(update);
+            }
+            unsafe {
+                PostMessageW(hwnd as HWND, WM_UPDATE_FOUND, 0, 0);
+            }
+        }
+    });
+}
+
+unsafe fn on_update_found() {
+    let Some(update) = FOUND_UPDATE.lock().ok().and_then(|mut found| found.take()) else {
+        return;
+    };
+    let is_new = with_app(|app| {
+        let is_new = app.available_update.as_ref() != Some(&update);
+        app.available_update = Some(update.clone());
+        is_new
+    })
+    .unwrap_or(false);
+    if is_new {
+        show_balloon(
+            &format!("Copyshot {} is available", update.version),
+            "Click here, or use the tray menu, to install it.",
+        );
+        with_app(|app| app.update_balloon_shown = true);
+    }
+}
+
+unsafe fn install_update() {
+    let Some((hwnd, update)) = with_app(|app| {
+        if app.installing_update {
+            return None;
+        }
+        let update = app.available_update.clone()?;
+        app.installing_update = true;
+        Some((app.hwnd as usize, update))
+    })
+    .flatten() else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let succeeded = match update::download_and_launch(&update) {
+            Ok(()) => 1,
+            Err(err) => {
+                if let Ok(mut error) = UPDATE_INSTALL_ERROR.lock() {
+                    *error = Some(err);
+                }
+                0
+            }
+        };
+        unsafe {
+            PostMessageW(hwnd as HWND, WM_UPDATE_INSTALL_DONE, succeeded, 0);
+        }
+    });
+}
+
+fn with_app<T>(f: impl FnOnce(&mut AppState) -> T) -> Option<T> {
+    APP.with(|app| app.borrow_mut().as_mut().map(f))
+}
+
+fn settings_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(APP_NAME)
+}
+
+// Only enable startup once, so turning it off in the tray menu sticks across launches.
+unsafe fn enable_startup_on_first_run() {
+    if std::env::var_os("LOCALAPPDATA").is_none() {
+        return;
+    }
+    let dir = settings_dir();
     let marker = dir.join("startup-configured");
     if marker.exists() {
         return;
@@ -1211,7 +1673,7 @@ fn lparam_point(lparam: LPARAM) -> POINT {
     }
 }
 
-fn wide(value: &str) -> Vec<u16> {
+pub(crate) fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
 
@@ -1314,5 +1776,84 @@ mod tests {
         assert_eq!((cropped.width, cropped.height), (2, 2));
         let blues: Vec<u8> = cropped.bgra.chunks(4).map(|p| p[0]).collect();
         assert_eq!(blues, vec![1, 2, 4, 5]);
+    }
+
+    fn rect(x: i32, y: i32, width: i32, height: i32) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn size_label_sits_above_then_below_then_inside_and_stays_on_screen() {
+        // Room above: label goes above.
+        let label = label_rect(rect(100, 200, 300, 100), 1.0, 1920, 1080);
+        assert_eq!((label.x, label.y + label.height + 6), (100, 200));
+        // Selection touches the top: label goes below.
+        let label = label_rect(rect(100, 0, 300, 100), 1.0, 1920, 1080);
+        assert_eq!(label.y, 106);
+        // Selection fills the screen: label goes inside.
+        let label = label_rect(rect(0, 0, 1920, 1080), 1.0, 1920, 1080);
+        assert_eq!(label.y, 6);
+        // Near the right edge: label is pulled back on screen.
+        let label = label_rect(rect(1900, 500, 20, 20), 1.0, 1920, 1080);
+        assert_eq!(label.x + label.width, 1920);
+        // Label grows with display scaling.
+        assert_eq!(
+            label_rect(rect(100, 200, 10, 10), 2.0, 4000, 4000).height,
+            48
+        );
+    }
+
+    #[test]
+    fn intersects_window_with_screen() {
+        assert_eq!(
+            intersect_rect(rect(-50, 10, 200, 100), rect(0, 0, 1920, 1080)),
+            Some(rect(0, 10, 150, 100))
+        );
+        assert_eq!(
+            intersect_rect(rect(2000, 0, 100, 100), rect(0, 0, 1920, 1080)),
+            None
+        );
+    }
+
+    #[test]
+    fn chime_is_a_short_quiet_pcm_wav() {
+        let wav = chime_wav();
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..16], b"WAVEfmt ");
+        let data_len = u32::from_le_bytes(wav[40..44].try_into().unwrap()) as usize;
+        assert_eq!(wav.len(), 44 + data_len);
+        let peak = wav[44..]
+            .chunks_exact(2)
+            .map(|s| i16::from_le_bytes([s[0], s[1]]).unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(peak > 1000 && peak < i16::MAX as u16 / 4, "peak {peak}");
+    }
+
+    #[test]
+    fn same_second_captures_get_numbered_names() {
+        let dir = std::env::temp_dir().join(format!("copyshot-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let names: Vec<String> = (0..3)
+            .map(|_| {
+                let (_, path) = create_unique_file(&dir, "Screenshot 2026").unwrap();
+                path.file_name().unwrap().to_string_lossy().into_owned()
+            })
+            .collect();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            names,
+            [
+                "Screenshot 2026.png",
+                "Screenshot 2026 (2).png",
+                "Screenshot 2026 (3).png"
+            ]
+        );
     }
 }

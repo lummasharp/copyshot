@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Copyshot</title>
+    <meta
+      name="description"
+      content="Copyshot is a tiny Windows screenshot tool that lives in the tray, saves PNGs and copies every capture to the clipboard."
+    />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="canonical" href="https://lummasharp.github.io/copyshot/" />
+    <link rel="icon" href="assets/copyshot.ico" sizes="any" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <a class="brand" href="https://github.com/lummasharp/copyshot">
+          <img src="assets/copyshot.ico" alt="" width="30" height="30" />
+          <span>Copyshot</span>
+        </a>
+        <h1>Press Print Screen. That's it.</h1>
+        <p class="lede">
+          A tiny Windows screenshot tool that lives in the tray. Every capture
+          is saved as a PNG and copied to your clipboard, ready to paste.
+        </p>
+        <p class="actions">
+          <a
+            class="primary"
+            data-download
+            href="https://github.com/lummasharp/copyshot/releases/latest"
+            >Download for Windows</a
+          >
+          <a href="https://github.com/lummasharp/copyshot">View on GitHub</a>
+        </p>
+        <p class="release-note" data-release-note hidden></p>
+      </header>
+
+      <div class="demo" role="img" aria-label="A dimmed screen with a bright selected region and a 640 × 360 size label">
+        <div class="demo-window">
+          <span></span><span></span><span></span>
+        </div>
+        <div class="demo-selection">
+          <span class="demo-label">640 × 360</span>
+        </div>
+      </div>
+
+      <section class="section">
+        <h2>Features</h2>
+        <ul class="feature-list">
+          <li>Drag to capture a region, with a live size readout</li>
+          <li>Capture just the active window</li>
+          <li>Capture every monitor at once</li>
+          <li>Saved to Pictures\Screenshots and copied to the clipboard</li>
+          <li>Sharp at any display scaling, across multiple monitors</li>
+          <li>A quiet chime confirms each capture (can be turned off)</li>
+          <li>Starts with Windows and stays out of the way</li>
+          <li>Updates itself from GitHub releases</li>
+        </ul>
+      </section>
+
+      <section class="section">
+        <h2>Controls</h2>
+        <div class="table-wrap">
+          <table>
+            <tbody>
+              <tr><td>Capture a region</td><td><kbd>Print Screen</kbd> or double-click the tray icon</td></tr>
+              <tr><td>Capture the active window</td><td><kbd>Alt</kbd> + <kbd>Print Screen</kbd></td></tr>
+              <tr><td>Capture the full desktop</td><td><kbd>Shift</kbd> + <kbd>Print Screen</kbd></td></tr>
+              <tr><td>Cancel a selection</td><td><kbd>Esc</kbd> or right-click</td></tr>
+              <tr><td>Settings</td><td>Right-click the tray icon</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Download</h2>
+        <p>
+          Windows 10 or later. The installer runs per user without
+          administrator access.
+        </p>
+        <p class="actions">
+          <a
+            class="primary"
+            data-download
+            href="https://github.com/lummasharp/copyshot/releases/latest"
+            >Download for Windows</a
+          >
+          <a href="https://github.com/lummasharp/copyshot/releases">All releases</a>
+          <a href="https://github.com/lummasharp/copyshot">Source code</a>
+        </p>
+      </section>
+
+      <footer class="footer">
+        <p>Free and open source, written in Rust.</p>
+        <p>Windows only.</p>
+      </footer>
+    </main>
+    <script src="site.js" defer></script>
+  </body>
+</html>
